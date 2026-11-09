@@ -1,0 +1,44 @@
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+dist/
+
+# IDE and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Generated data and experiment outputs
+data/raw/
+data/processed/
+outputs/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
