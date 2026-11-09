@@ -42,3 +42,4 @@ outputs/
 *.tmp
 *.bak
 *.swp
+.virtual_documents/
