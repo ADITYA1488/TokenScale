@@ -1,9 +1,18 @@
-
-from fastapi import FastAPI, HTTPException
+import sqlite3
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from src.api.service import run_optimization, load_telemetry, load_forecasts
+from src.api.service import (
+    run_optimization,
+    load_telemetry,
+    load_forecasts,
+    load_live_status,
+    load_live_telemetry,
+    load_live_history
+)
+
 
 app = FastAPI(
     title="TokenScale API",
@@ -69,4 +78,36 @@ def optimize(request: OptimizationRequest):
     except FileNotFoundError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/live/status")
+def get_live_status():
+    try:
+        return load_live_status()
+    except (FileNotFoundError, sqlite3.Error) as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/live/telemetry")
+def get_live_telemetry():
+    try:
+        return load_live_telemetry()
+    except (FileNotFoundError, sqlite3.Error) as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/live/history")
+def get_live_history(
+    metric_type: str = Query(
+        default=None,
+        description="Optional: sglang, gpu, or cpu"
+    ),
+    limit: int = Query(default=500, ge=1, le=5000)
+):
+    try:
+        return load_live_history(metric_type, limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except (FileNotFoundError, sqlite3.Error) as exc:
         raise HTTPException(status_code=500, detail=str(exc))

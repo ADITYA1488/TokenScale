@@ -1,13 +1,15 @@
-
+import sqlite3
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 import pandas as pd
 
 from src.agents.workflow import build_tokenscale_graph
-
+from contextlib import closing
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
-
+LIVE_DB_PATH = PROJECT_ROOT / "data" / "live" / "tokenscale_live.db"
 tokenscale_graph = build_tokenscale_graph()
 
 
@@ -103,3 +105,158 @@ def load_forecasts():
     df = df.astype(object).where(pd.notna(df), None)
 
     return df.to_dict(orient="records")
+
+
+def _get_live_connection():
+    if not LIVE_DB_PATH.exists():
+        raise FileNotFoundError(
+            f"Live telemetry database not found: {LIVE_DB_PATH}"
+        )
+
+    connection = sqlite3.connect(LIVE_DB_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def load_live_status():
+    now = datetime.now(timezone.utc)
+
+    with closing(_get_live_connection()) as connection:
+        counts = connection.execute("""
+            SELECT metric_type, COUNT(*) AS record_count
+            FROM telemetry_records
+            GROUP BY metric_type
+        """).fetchall()
+
+        latest_records = connection.execute("""
+            SELECT metric_type, MAX(timestamp_ms) AS latest_timestamp
+            FROM telemetry_records
+            GROUP BY metric_type
+        """).fetchall()
+
+        dashboard_row = connection.execute("""
+            SELECT generated_at, fetched_at, from_cache, payload
+            FROM dashboard_snapshots
+            ORDER BY id DESC
+            LIMIT 1
+        """).fetchone()
+
+    record_counts = {
+        row["metric_type"]: row["record_count"]
+        for row in counts
+    }
+
+    metrics = {}
+
+    for row in latest_records:
+        timestamp_ms = row["latest_timestamp"]
+        age_seconds = (
+            now.timestamp() - timestamp_ms / 1000
+        )
+
+        metrics[row["metric_type"]] = {
+            "latest_timestamp": timestamp_ms,
+            "age_seconds": round(age_seconds, 2),
+            "fresh": 0 <= age_seconds <= 300
+        }
+
+    dashboard = None
+
+    if dashboard_row:
+        dashboard = json.loads(dashboard_row["payload"])
+
+    return {
+        "collector_database": str(LIVE_DB_PATH),
+        "database_exists": True,
+        "record_counts": record_counts,
+        "latest_metrics": metrics,
+        "dashboard": dashboard,
+        "last_dashboard_fetch": (
+            dashboard_row["fetched_at"] if dashboard_row else None
+        ),
+        "last_dashboard_from_cache": (
+            bool(dashboard_row["from_cache"])
+            if dashboard_row else None
+        )
+    }
+
+
+def load_live_telemetry():
+    with closing(_get_live_connection()) as connection:
+        rows = connection.execute("""
+            SELECT
+                metric_type,
+                entity_id,
+                timestamp_ms,
+                payload,
+                fetched_at
+            FROM telemetry_records AS current
+            WHERE timestamp_ms = (
+                SELECT MAX(previous.timestamp_ms)
+                FROM telemetry_records AS previous
+                WHERE previous.metric_type = current.metric_type
+                  AND previous.entity_id = current.entity_id
+            )
+            ORDER BY metric_type, entity_id
+        """).fetchall()
+
+    results = {
+        "sglang": [],
+        "gpu": [],
+        "cpu": []
+    }
+
+    for row in rows:
+        record = json.loads(row["payload"])
+        record["_collected_at"] = row["fetched_at"]
+        record["_timestamp_ms"] = row["timestamp_ms"]
+
+        results[row["metric_type"]].append(record)
+
+    return results
+
+
+def load_live_history(metric_type=None, limit=500):
+    allowed_types = {"sglang", "gpu", "cpu"}
+
+    if metric_type is not None and metric_type not in allowed_types:
+        raise ValueError(
+            f"Invalid metric_type. Choose from: {sorted(allowed_types)}"
+        )
+
+    limit = max(1, min(limit, 5000))
+
+    with closing(_get_live_connection()) as connection:
+        if metric_type:
+            rows = connection.execute("""
+                SELECT metric_type, entity_id, timestamp_ms,
+                       payload, fetched_at
+                FROM telemetry_records
+                WHERE metric_type = ?
+                ORDER BY timestamp_ms DESC
+                LIMIT ?
+            """, (metric_type, limit)).fetchall()
+        else:
+            rows = connection.execute("""
+                SELECT metric_type, entity_id, timestamp_ms,
+                       payload, fetched_at
+                FROM telemetry_records
+                ORDER BY timestamp_ms DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+
+    records = []
+
+    for row in rows:
+        record = json.loads(row["payload"])
+        record["_metric_type"] = row["metric_type"]
+        record["_entity_id"] = row["entity_id"]
+        record["_collected_at"] = row["fetched_at"]
+        records.append(record)
+
+    return {
+        "count": len(records),
+        "metric_type": metric_type or "all",
+        "records": records
+    }
+

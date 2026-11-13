@@ -40,3 +40,27 @@ export async function runOptimization(
     })
   });
 }
+
+
+export async function getLiveStatus() {
+  return fetchJSON("/live/status");
+}
+
+export async function getLiveTelemetry() {
+  return fetchJSON("/live/telemetry");
+}
+
+export async function getLiveHistory(
+  metricType?: "sglang" | "gpu" | "cpu",
+  limit = 500
+) {
+  const params = new URLSearchParams({
+    limit: String(limit)
+  });
+
+  if (metricType) {
+    params.set("metric_type", metricType);
+  }
+
+  return fetchJSON(`/live/history?${params.toString()}`);
+}

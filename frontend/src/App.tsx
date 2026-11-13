@@ -1,10 +1,12 @@
-
 import { useState, useEffect, useMemo } from "react";
 import ReactECharts from "echarts-for-react";
 import {
   runOptimization,
   getTelemetry,
-  getForecasts
+  getForecasts,
+  getLiveStatus,
+  getLiveTelemetry,
+  getLiveHistory
 } from "./services/api";
 
 import {
@@ -16,6 +18,7 @@ import {
 
 const navigation = [
   { label: "Command Center", icon: Command },
+  { label: "Live Monitoring", icon: Activity },
   { label: "Telemetry", icon: Activity },
   { label: "Forecasting", icon: BrainCircuit },
   { label: "Diagnostics", icon: ShieldAlert },
@@ -23,6 +26,8 @@ const navigation = [
   { label: "Simulation", icon: Layers3 },
   { label: "Experiments", icon: Database }
 ];
+
+
 
 function Metric({ label, value, unit, icon: Icon, note }: any) {
   return (
@@ -72,6 +77,17 @@ function App() {
   const [forecastLoading, setForecastLoading] = useState(true);
   const [forecastError, setForecastError] = useState("");
 
+
+const [liveStatus, setLiveStatus] = useState<any>(null);
+const [liveTelemetry, setLiveTelemetry] = useState<any>(null);
+const [liveLoading, setLiveLoading] = useState(true);
+const [liveError, setLiveError] = useState("");
+const [lastLiveUpdated, setLastLiveUpdated] = useState<Date | null>(null);
+const [liveHistory, setLiveHistory] = useState<any>({
+  sglang: [],
+  gpu: []
+});
+
   useEffect(() => {
     async function loadData() {
       try {
@@ -102,6 +118,56 @@ function App() {
     loadData();
   }, []);
 
+
+useEffect(() => {
+  let cancelled = false;
+
+  async function loadLiveData() {
+    try {
+      const [status, telemetry, sglangHistory, gpuHistory] =
+  await Promise.all([
+    getLiveStatus(),
+    getLiveTelemetry(),
+    getLiveHistory("sglang", 500),
+    getLiveHistory("gpu", 500)
+  ]);
+
+      if (cancelled) return;
+
+      setLiveStatus(status);
+      setLiveTelemetry(telemetry);
+      setLiveHistory({
+  sglang: sglangHistory.records ?? [],
+  gpu: gpuHistory.records ?? []
+});
+      setLiveError("");
+      setLastLiveUpdated(new Date());
+    } catch (error) {
+      if (cancelled) return;
+
+      setLiveError(
+        error instanceof Error
+          ? error.message
+          : "Live telemetry unavailable"
+      );
+    } finally {
+      if (!cancelled) {
+        setLiveLoading(false);
+      }
+    }
+  }
+
+  loadLiveData();
+
+  const interval = window.setInterval(loadLiveData, 60_000);
+
+  return () => {
+    cancelled = true;
+    window.clearInterval(interval);
+  };
+}, []);
+
+
   async function handleOptimize() {
     setLoading(true);
     setApiError("");
@@ -122,6 +188,329 @@ function App() {
   const inference = telemetry?.inference ?? [];
   const gpu = telemetry?.gpu ?? [];
   const cpu = telemetry?.cpu ?? [];
+
+
+const liveInference = liveTelemetry?.sglang ?? [];
+const liveGpu = liveTelemetry?.gpu ?? [];
+const liveCpu = liveTelemetry?.cpu ?? [];
+
+const liveThroughput = liveInference.reduce(
+  (sum: number, record: any) =>
+    sum + (Number(record.gen_throughput) || 0),
+  0
+);
+
+const liveGpuUtil = average(liveGpu, "utilization_pct");
+const liveVram = average(liveGpu, "memory_pct");
+const liveCpuUtil = average(liveCpu, "cpu_util_pct");
+
+const liveActiveServers = liveInference.filter(
+  (record: any) => Number(record.gen_throughput) > 0
+).length;
+
+const liveFreshness = liveStatus?.latest_metrics ?? {};
+
+function buildLiveSeries(
+  records: any[],
+  field: string,
+  mode: "sum" | "average"
+) {
+  const buckets = new Map<
+    number,
+    Map<string, { timestamp: number; value: number }>
+  >();
+
+  records.forEach((record: any) => {
+    if (
+      record[field] === null ||
+      record[field] === undefined ||
+      record[field] === ""
+    ) {
+      return;
+    }
+
+    const timestamp = Number(record.ts);
+    const value = Number(record[field]);
+
+    if (!Number.isFinite(timestamp) || !Number.isFinite(value)) {
+      return;
+    }
+
+    // Group samples into one-minute buckets.
+    const bucket = Math.floor(timestamp / 60000) * 60000;
+
+    // Keep the latest sample for each entity in each bucket.
+    const entity =
+      record._entity_id ??
+      record.gpu_id ??
+      record.node_id ??
+      "unknown";
+
+    if (!buckets.has(bucket)) {
+      buckets.set(bucket, new Map());
+    }
+
+    const entities = buckets.get(bucket)!;
+    const existing = entities.get(entity);
+
+    if (!existing || timestamp > existing.timestamp) {
+      entities.set(entity, { timestamp, value });
+    }
+  });
+
+  return Array.from(buckets.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([timestamp, entities]) => {
+      const values = Array.from(entities.values()).map(item => item.value);
+
+      return {
+        time: new Date(timestamp).toLocaleTimeString("en-IN", {
+          hour: "2-digit",
+          minute: "2-digit"
+        }),
+        value:
+          mode === "sum"
+            ? values.reduce((sum, value) => sum + value, 0)
+            : values.reduce((sum, value) => sum + value, 0) / values.length
+      };
+    });
+}
+
+
+  const liveThroughputSeries = useMemo(
+    () => buildLiveSeries(liveHistory.sglang, "gen_throughput", "sum"),
+    [liveHistory]
+  );
+
+  const liveLatencySeries = useMemo(
+    () => buildLiveSeries(liveHistory.sglang, "e2e_latency_avg_s", "average"),
+    [liveHistory]
+  );
+
+  const liveGpuUtilSeries = useMemo(
+    () => buildLiveSeries(liveHistory.gpu, "utilization_pct", "average"),
+    [liveHistory]
+  );
+
+  const liveGpuMemorySeries = useMemo(
+    () => buildLiveSeries(liveHistory.gpu, "memory_pct", "average"),
+    [liveHistory]
+  );
+
+  function makeLiveChart(title: string, unit: string, series: any[]) {
+    return {
+      backgroundColor: "transparent",
+      tooltip: { trigger: "axis" },
+      grid: { left: 55, right: 15, top: 20, bottom: 35 },
+      xAxis: {
+        type: "category",
+        boundaryGap: false,
+        data: series.map((point: any) => point.time),
+        axisLabel: { color: "#748291", fontSize: 10 },
+        axisLine: { lineStyle: { color: "#283440" } }
+      },
+      yAxis: {
+        type: "value",
+        name: unit,
+        axisLabel: { color: "#748291", fontSize: 10 },
+        nameTextStyle: { color: "#748291" },
+        splitLine: {
+          lineStyle: { color: "#202B35", type: "dashed" }
+        }
+      },
+      series: [{
+        name: title,
+        type: "line",
+        smooth: 0.3,
+        symbol: "none",
+        connectNulls: false,
+        data: series.map((point: any) => point.value),
+        lineStyle: { color: "#C7F36B", width: 2 },
+        areaStyle: { color: "rgba(199,243,107,0.08)" }
+      }]
+    };
+  }
+
+  const liveThroughputChart = useMemo(
+    () => makeLiveChart("Throughput", "tokens/s", liveThroughputSeries),
+    [liveThroughputSeries]
+  );
+
+  const liveLatencyChart = useMemo(
+    () => makeLiveChart("Latency", "seconds", liveLatencySeries),
+    [liveLatencySeries]
+  );
+
+  const liveGpuUtilChart = useMemo(
+    () => makeLiveChart("GPU utilization", "%", liveGpuUtilSeries),
+    [liveGpuUtilSeries]
+  );
+
+  const liveGpuMemoryChart = useMemo(
+    () => makeLiveChart("GPU memory", "%", liveGpuMemorySeries),
+    [liveGpuMemorySeries]
+  );
+
+const liveGpuMemoryByDeviceChart = useMemo(() => {
+  const buckets = new Map<
+    number,
+    Map<string, { timestamp: number; value: number }>
+  >();
+
+  liveHistory.gpu.forEach((record: any) => {
+    if (record.memory_pct == null) return;
+
+    const timestamp = Number(record.ts);
+    const value = Number(record.memory_pct);
+
+    if (!Number.isFinite(timestamp) || !Number.isFinite(value)) return;
+
+    const bucket = Math.floor(timestamp / 60000) * 60000;
+    const entity = record.gpu_id ?? record._entity_id ?? record.node_id;
+
+    if (!buckets.has(bucket)) buckets.set(bucket, new Map());
+
+    const devices = buckets.get(bucket)!;
+    const previous = devices.get(entity);
+
+    if (!previous || timestamp > previous.timestamp) {
+      devices.set(entity, { timestamp, value });
+    }
+  });
+
+  const times = Array.from(buckets.keys()).sort((a, b) => a - b);
+
+  const devices = Array.from(
+    new Set(
+      Array.from(buckets.values()).flatMap(bucket =>
+        Array.from(bucket.keys())
+      )
+    )
+  ).sort();
+
+  return {
+    backgroundColor: "transparent",
+    tooltip: { trigger: "axis" },
+    legend: {
+      type: "scroll",
+      textStyle: { color: "#9AA8B8", fontSize: 10 }
+    },
+    grid: { left: 55, right: 15, top: 45, bottom: 35 },
+    xAxis: {
+      type: "category",
+      boundaryGap: false,
+      data: times.map(timestamp =>
+        new Date(timestamp).toLocaleTimeString("en-IN", {
+          hour: "2-digit",
+          minute: "2-digit"
+        })
+      ),
+      axisLabel: { color: "#748291", fontSize: 10 },
+      axisLine: { lineStyle: { color: "#283440" } }
+    },
+    yAxis: {
+      type: "value",
+      name: "%",
+      min: 0,
+      max: 100,
+      axisLabel: { color: "#748291", fontSize: 10 },
+      splitLine: {
+        lineStyle: { color: "#202B35", type: "dashed" }
+      }
+    },
+    series: devices.map(device => ({
+      name: device,
+      type: "line",
+      smooth: 0.2,
+      symbol: "none",
+      connectNulls: false,
+      data: times.map(timestamp =>
+        buckets.get(timestamp)?.get(device)?.value ?? null
+      )
+    }))
+  };
+}, [liveHistory]);
+
+const liveGpuMemoryActivityByDeviceChart = useMemo(() => {
+  const buckets = new Map<
+    number,
+    Map<string, { timestamp: number; value: number }>
+  >();
+
+  liveHistory.gpu.forEach((record: any) => {
+    if (record.memory_util_pct == null) return;
+
+    const timestamp = Number(record.ts);
+    const value = Number(record.memory_util_pct);
+
+    if (!Number.isFinite(timestamp) || !Number.isFinite(value)) return;
+
+    const bucket = Math.floor(timestamp / 60000) * 60000;
+    const entity = record.gpu_id ?? record._entity_id ?? record.node_id;
+
+    if (!buckets.has(bucket)) buckets.set(bucket, new Map());
+
+    const devices = buckets.get(bucket)!;
+    const previous = devices.get(entity);
+
+    if (!previous || timestamp > previous.timestamp) {
+      devices.set(entity, { timestamp, value });
+    }
+  });
+
+  const times = Array.from(buckets.keys()).sort((a, b) => a - b);
+
+  const devices = Array.from(
+    new Set(
+      Array.from(buckets.values()).flatMap(bucket =>
+        Array.from(bucket.keys())
+      )
+    )
+  ).sort();
+
+  return {
+    backgroundColor: "transparent",
+    tooltip: { trigger: "axis" },
+    legend: {
+      type: "scroll",
+      textStyle: { color: "#9AA8B8", fontSize: 10 }
+    },
+    grid: { left: 55, right: 15, top: 45, bottom: 35 },
+    xAxis: {
+      type: "category",
+      boundaryGap: false,
+      data: times.map(timestamp =>
+        new Date(timestamp).toLocaleTimeString("en-IN", {
+          hour: "2-digit",
+          minute: "2-digit"
+        })
+      ),
+      axisLabel: { color: "#748291", fontSize: 10 },
+      axisLine: { lineStyle: { color: "#283440" } }
+    },
+    yAxis: {
+      type: "value",
+      name: "%",
+      min: 0,
+      max: 100,
+      axisLabel: { color: "#748291", fontSize: 10 },
+      splitLine: {
+        lineStyle: { color: "#202B35", type: "dashed" }
+      }
+    },
+    series: devices.map(device => ({
+      name: device,
+      type: "line",
+      smooth: 0.2,
+      symbol: "none",
+      connectNulls: false,
+      data: times.map(timestamp =>
+        buckets.get(timestamp)?.get(device)?.value ?? null
+      )
+    }))
+  };
+}, [liveHistory]);
+
 
   const latestInference = useMemo(() => {
     const latest = new Map<string, any>();
@@ -473,6 +862,272 @@ function App() {
     );
   }
 
+
+function renderLiveMonitoring() {
+  return (
+    <>
+      <section className="metrics-grid">
+        <Metric
+          label="LIVE THROUGHPUT"
+          value={liveLoading ? "..." : liveThroughput.toFixed(1)}
+          unit=" tok/s"
+          icon={Zap}
+          note="Latest observed SGLang throughput"
+        />
+
+        <Metric
+          label="ACTIVE SERVERS"
+          value={liveActiveServers}
+          unit={` / ${liveInference.length}`}
+          icon={Server}
+          note="Servers with positive observed throughput"
+        />
+
+        <Metric
+          label="GPU UTILIZATION"
+          value={liveGpuUtil === null ? "—" : liveGpuUtil.toFixed(1)}
+          unit="%"
+          icon={Cpu}
+          note="Mean latest GPU utilization"
+        />
+
+        <Metric
+          label="CPU UTILIZATION"
+          value={liveCpuUtil === null ? "—" : liveCpuUtil.toFixed(1)}
+          unit="%"
+          icon={Activity}
+          note="Mean latest node CPU utilization"
+        />
+      </section>
+
+            <section className="primary-grid">
+        <div className="panel chart-panel">
+          <SectionHeading
+            eyebrow="LIVE HISTORY / 001"
+            title="Inference throughput"
+          />
+          <ReactECharts
+            option={liveThroughputChart}
+            style={{ height: 260 }}
+            notMerge
+          />
+        </div>
+
+        <div className="panel chart-panel">
+          <SectionHeading
+            eyebrow="LIVE HISTORY / 002"
+            title="Inference latency"
+          />
+          <ReactECharts
+            option={liveLatencyChart}
+            style={{ height: 260 }}
+            notMerge
+          />
+        </div>
+
+        <div className="panel chart-panel">
+          <SectionHeading
+            eyebrow="LIVE HISTORY / 003"
+            title="GPU utilization"
+          />
+          <ReactECharts
+            option={liveGpuUtilChart}
+            style={{ height: 260 }}
+            notMerge
+          />
+        </div>
+
+        <div className="panel chart-panel">
+          <SectionHeading
+            eyebrow="LIVE HISTORY / 004"
+            title="GPU memory usage"
+          />
+          <ReactECharts
+            option={liveGpuMemoryChart}
+            style={{ height: 260 }}
+            notMerge
+          />
+        </div>
+
+        <div className="panel chart-panel">
+          <SectionHeading
+            eyebrow="LIVE HISTORY / 005"
+            title="Per-GPU memory utilization"
+          />
+          <ReactECharts
+            option={liveGpuMemoryByDeviceChart}
+            style={{ height: 300 }}
+            notMerge
+          />
+        </div>
+
+        <div className="panel chart-panel">
+          <SectionHeading
+            eyebrow="LIVE HISTORY / 006"
+            title="Per-GPU memory activity"
+          />
+          <ReactECharts
+            option={liveGpuMemoryActivityByDeviceChart}
+            style={{ height: 300 }}
+            notMerge
+          />
+        </div>
+      </section>
+
+      {liveError && (
+        <div className="api-error">
+          Live telemetry unavailable: {liveError}
+        </div>
+      )}
+
+      <section className="primary-grid">
+        <div className="panel health-panel">
+          <SectionHeading
+            eyebrow="LIVE INFRASTRUCTURE / 001"
+            title="Resource utilization"
+          />
+
+          {[
+            { label: "GPU compute", value: liveGpuUtil },
+            { label: "GPU memory", value: liveVram },
+            { label: "CPU utilization", value: liveCpuUtil }
+          ].map((item) => (
+            <div className="health-item" key={item.label}>
+              <div className="health-title">
+                <span>{item.label}</span>
+                <b>
+                  {item.value === null
+                    ? "—"
+                    : `${item.value.toFixed(1)}%`}
+                </b>
+              </div>
+              <div className="progress">
+                <i
+                  style={{
+                    width: `${item.value === null
+                      ? 0
+                      : Math.min(100, Math.max(0, item.value))}%`
+                  }}
+                />
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div className="panel health-panel">
+          <SectionHeading
+            eyebrow="COLLECTOR / 002"
+            title="Data freshness"
+          />
+
+          {["sglang", "gpu", "cpu"].map((type) => {
+            const metric = liveFreshness[type];
+
+            return (
+              <div className="result-line" key={type}>
+                <span>{type.toUpperCase()}</span>
+                <b>
+                  {metric
+                    ? `${metric.age_seconds.toFixed(1)}s`
+                    : "Unavailable"}
+                </b>
+                <span className={`node-status ${
+                  metric?.fresh ? "good" : "warn"
+                }`}>
+                  {metric?.fresh ? "FRESH" : "STALE"}
+                </span>
+              </div>
+            );
+          })}
+
+          <p className="optimizer-note">
+            Freshness is based on the timestamp of the latest
+            recorded sample.
+          </p>
+
+          <div className="result-line">
+            <span>Last frontend fetch</span>
+            <b>
+              {lastLiveUpdated
+                ? lastLiveUpdated.toLocaleTimeString()
+                : "Waiting"}
+            </b>
+          </div>
+        </div>
+      </section>
+
+      <div className="panel nodes-panel">
+        <SectionHeading
+          eyebrow="INFERENCE / 003"
+          title="Live inference servers"
+        />
+
+        <div className="node-table">
+          <div className="table-head">
+            <span>SERVER</span>
+            <span>THROUGHPUT</span>
+            <span>LATENCY</span>
+          </div>
+
+          {liveInference.map((record: any) => (
+            <div className="table-row" key={record.server_id}>
+              <span className="node-name">
+                {record.server_id}
+              </span>
+              <span className="mono">
+                {Number(record.gen_throughput).toFixed(1)} tok/s
+              </span>
+              <span className="mono">
+                {record.e2e_latency_avg_s == null
+                  ? "—"
+                  : `${Number(record.e2e_latency_avg_s).toFixed(3)} s`}
+              </span>
+            </div>
+          ))}
+
+          {!liveInference.length && (
+            <EmptyState message="No live inference records available." />
+          )}
+        </div>
+      </div>
+
+      <div className="panel nodes-panel">
+        <SectionHeading
+          eyebrow="GPU / 004"
+          title="Live GPU measurements"
+        />
+
+        <div className="node-table">
+          <div className="table-head">
+            <span>GPU</span>
+            <span>UTILIZATION</span>
+            <span>VRAM</span>
+          </div>
+
+          {liveGpu.map((record: any) => (
+            <div className="table-row" key={record.gpu_id}>
+              <span className="node-name">{record.gpu_id}</span>
+              <span className="mono">
+                {record.utilization_pct ?? "—"}%
+              </span>
+              <span className="mono">
+                {record.memory_pct == null
+                  ? "—"
+                  : `${Number(record.memory_pct).toFixed(1)}%`}
+              </span>
+            </div>
+          ))}
+
+          {!liveGpu.length && (
+            <EmptyState message="No live GPU records available." />
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+
   function renderTelemetry() {
     return (
       <>
@@ -741,6 +1396,7 @@ function App() {
 
   const pageRenderers: Record<string, () => any> = {
     "Command Center": renderCommandCenter,
+    "Live Monitoring": renderLiveMonitoring,
     "Telemetry": renderTelemetry,
     "Forecasting": renderForecasting,
     "Diagnostics": renderDiagnostics,

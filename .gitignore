@@ -43,3 +43,13 @@ outputs/
 *.bak
 *.swp
 .virtual_documents/
+
+
+# Live telemetry and local databases
+data/live/
+*.db
+*.sqlite
+*.sqlite3
+
+# TypeScript build cache
+frontend/tsconfig.tsbuildinfo
